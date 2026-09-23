@@ -1,0 +1,239 @@
+name: banca-apis
+
+services:
+  clientes-api:
+    build:
+      context: ./clientes-api
+    image: banca/clientes-api:1.0.0
+    container_name: clientes-api
+    environment:
+      PORT: 3001
+      LOG_FORMAT: combined
+    ports:
+      - "3001:3001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks: [banca]
+
+  cuentas-api:
+    build:
+      context: ./cuentas-api
+    image: banca/cuentas-api:1.0.0
+    container_name: cuentas-api
+    environment:
+      PORT: 3002
+      LOG_FORMAT: combined
+    ports:
+      - "3002:3002"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks: [banca]
+
+  movimiento-api:
+    build:
+      context: ./movimiento-api
+    image: banca/movimiento-api:1.0.0
+    container_name: movimiento-api
+    environment:
+      PORT: 3003
+      LOG_FORMAT: combined
+    ports:
+      - "3003:3003"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks: [banca]
+
+  # El directorio solr no existe en la imagen de WSO2 (se crea al arrancar), así que Docker monta
+  # el volumen como root; este paso lo entrega al usuario de WSO2 (uid 10001) antes de iniciar.
+  wso2am-volumes:
+    image: node:24-alpine
+    container_name: wso2am-volumes
+    command: ["chown", "-R", "10001:10001", "/solr"]
+    volumes:
+      - wso2am-solr:/solr
+    restart: "no"
+
+  wso2am:
+    image: wso2/wso2am:4.7.0
+    container_name: wso2am
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}   # usado por deployment.toml ($env{PUBLIC_HOST})
+      WSO2_ENCRYPTION_KEY: ${WSO2_ENCRYPTION_KEY:?Defina WSO2_ENCRYPTION_KEY en .env (openssl rand -hex 32)}
+    ports:
+      - "9443:9443"   # Publisher, Developer Portal, Admin (HTTPS)
+      - "8243:8243"   # Gateway HTTPS
+      - "8280:8280"   # Gateway HTTP
+    volumes:
+      # Persiste la base H2 (APIs, productos, suscripciones) entre reinicios
+      - wso2am-db:/home/wso2carbon/wso2am-4.7.0/repository/database
+      # Índice de búsqueda (Solr): sin él, al recrear el contenedor el Publisher y el Developer
+      # Portal dejan de listar las APIs aunque sigan en la base de datos
+      - wso2am-solr:/home/wso2carbon/wso2am-4.7.0/solr
+      # Configuración con hostname público (login de consolas y URLs del gateway)
+      - ./wso2/deployment.toml:/home/wso2carbon/wso2am-4.7.0/repository/conf/deployment.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf https://localhost:9443/services/Version >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 10
+    depends_on:
+      wso2am-volumes:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [banca]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    container_name: keycloak
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Issuer fijo (http://<PUBLIC_HOST>:8180/realms/<reino>) aunque WSO2 llame por la red interna;
+      # los endpoints de backchannel (token, JWKS, DCR) usan el host de la petición (keycloak:8080)
+      KC_HOSTNAME: http://${PUBLIC_HOST:-localhost}:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8180:8080"   # el 8080 del host lo usa otro servicio
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      # La imagen no trae curl: se consulta /health/ready del puerto de gestión con bash
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    restart: unless-stopped
+    networks: [banca]
+
+  # Tarea de una sola ejecución: configura Keycloak (reinos) y WSO2 (Key Managers, APIs y productos)
+  setup:
+    image: node:24-alpine
+    container_name: setup
+    command: ["node", "/setup/index.mjs"]
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:8180
+      KEYCLOAK_ADMIN_USER: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_WSO2_CLIENT_SECRET: wso2-km-secret
+      BANCA_PERSONA_CLIENT_SECRET: ${BANCA_PERSONA_CLIENT_SECRET:-banca-persona-secret}
+      BANCA_EMPRESA_CLIENT_SECRET: ${BANCA_EMPRESA_CLIENT_SECRET:-banca-empresa-secret}
+      BANCA_MUJER_CLIENT_SECRET: ${BANCA_MUJER_CLIENT_SECRET:-banca-mujer-secret}
+      WSO2_URL: https://wso2am:9443
+      GATEWAY_URL: https://wso2am:8243
+      GATEWAY_VHOST: ${PUBLIC_HOST:-localhost}   # vhost del entorno Default del gateway
+      WSO2_ADMIN_USER: admin
+      WSO2_ADMIN_PASSWORD: admin
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"   # WSO2 usa un certificado autofirmado en local
+      NODE_NO_WARNINGS: "1"
+    volumes:
+      - ./setup:/setup:ro
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      wso2am:
+        condition: service_healthy
+      clientes-api:
+        condition: service_healthy
+      cuentas-api:
+        condition: service_healthy
+      movimiento-api:
+        condition: service_healthy
+    restart: "no"
+    networks: [banca]
+
+  # Canales: aplicaciones Next.js que se autentican con Client Credentials en su propio reino y
+  # consumen los productos de WSO2 con tokens de reino-cliente y reino-cuenta (ver setup/config.mjs)
+  banca-persona:
+    build:
+      context: ./banca-persona
+    image: banca/banca-persona:1.0.0
+    container_name: banca-persona
+    environment:
+      PORT: 3101
+      KEYCLOAK_URL: http://keycloak:8080
+      GATEWAY_URL: http://wso2am:8280
+      CHANNEL_REALM: reino-banca-persona
+      CHANNEL_CLIENT_ID: banca-persona
+      CHANNEL_CLIENT_SECRET: ${BANCA_PERSONA_CLIENT_SECRET:-banca-persona-secret}
+    ports:
+      - "3101:3101"
+    read_only: true
+    tmpfs:
+      - /app/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [banca]
+
+  banca-empresa:
+    build:
+      context: ./banca-empresa
+    image: banca/banca-empresa:1.0.0
+    container_name: banca-empresa
+    environment:
+      PORT: 3102
+      KEYCLOAK_URL: http://keycloak:8080
+      GATEWAY_URL: http://wso2am:8280
+      CHANNEL_REALM: reino-banca-empresa
+      CHANNEL_CLIENT_ID: banca-empresa
+      CHANNEL_CLIENT_SECRET: ${BANCA_EMPRESA_CLIENT_SECRET:-banca-empresa-secret}
+    ports:
+      - "3102:3102"
+    read_only: true
+    tmpfs:
+      - /app/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [banca]
+
+  banca-mujer:
+    build:
+      context: ./banca-mujer
+    image: banca/banca-mujer:1.0.0
+    container_name: banca-mujer
+    environment:
+      PORT: 3103
+      KEYCLOAK_URL: http://keycloak:8080
+      GATEWAY_URL: http://wso2am:8280
+      CHANNEL_REALM: reino-banca-persona
+      CHANNEL_CLIENT_ID: banca-mujer
+      CHANNEL_CLIENT_SECRET: ${BANCA_MUJER_CLIENT_SECRET:-banca-mujer-secret}
+    ports:
+      - "3103:3103"
+    read_only: true
+    tmpfs:
+      - /app/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [banca]
+
+networks:
+  banca:
+    driver: bridge
+
+volumes:
+  wso2am-db:
+  wso2am-solr:
+  keycloak-data:

@@ -1,0 +1,21 @@
+# Dependencias y builds
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Variables locales (IPs del servidor, clave de cifrado de WSO2). Ver .env.example
+.env
+.env.*
+!.env.example
+
+# Herramientas locales
+.playwright-mcp/
+MEMORY.md
+
+# Sistema y editores
+.DS_Store
+*.log
+.idea/
+.vscode/
