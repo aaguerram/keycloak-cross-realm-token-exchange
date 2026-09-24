@@ -1,5 +1,7 @@
 # APIs bancarias (BIAN / ISO 20022)
 
+> Arquitectura, flujo de una petición (diagrama de secuencia), rol y scope, y conceptos de Keycloak: ver **[DOCUMENTACION.md](DOCUMENTACION.md)**.
+
 | Servicio | Puerto | Service Domain BIAN | Swagger |
 |---|---|---|---|
 | clientes-api | 3001 | Party Reference Data Directory | http://localhost:3001/docs |
@@ -8,13 +10,124 @@
 
 La especificación OpenAPI 3.1 en JSON está en `/openapi.json` de cada servicio.
 
-## Levantar
+## Levantar el entorno paso a paso
+
+### 1. Requisitos
+
+- **Docker Engine** con **Docker Compose v2** (`docker compose version`) y BuildKit (activo por defecto; los `Dockerfile` usan `--mount=type=cache`).
+- **~6 GB de RAM libres**: WSO2 API Manager solo consume 2-4 GB.
+- **Puertos libres en el host**: `3001-3003` (APIs), `3101-3103` (canales), `8180` (Keycloak), `9443`, `8243` y `8280` (WSO2).
+- **openssl**, para generar la clave de cifrado de WSO2.
+- *Opcional:* **Node.js ≥ 22** en el host, solo para ejecutar las pruebas de `setup/test-*.mjs`.
+
+### 2. Crear el archivo `.env`
+
+`docker compose` lee automáticamente el archivo `.env` de la raíz del proyecto y sustituye `${VARIABLE}` en `docker-compose.yml`. `.env` está en `.gitignore` (contiene la IP del servidor y la clave de cifrado); el repositorio solo trae la plantilla `.env.example`.
 
 ```bash
-cp .env.example .env                                   # ajusta PUBLIC_HOST
+cp .env.example .env
+```
+
+### 3. Elegir `PUBLIC_HOST`
+
+Es el host con el que **el navegador y los clientes externos** llegan a WSO2 y Keycloak. Decide:
+
+| Caso | Valor |
+|---|---|
+| Solo usarás el entorno desde esta misma máquina | `PUBLIC_HOST=localhost` |
+| Otras máquinas de la red (LAN, VPN, Tailscale) accederán | la IP o nombre DNS de este servidor |
+
+Para ver las IPs del servidor:
+
+```bash
+hostname -I            # todas las IPv4 (la primera suele ser la de la LAN)
+ip -4 -brief addr      # IPs por interfaz
+tailscale ip -4        # IP de Tailscale (100.x.x.x), si la usas
+```
+
+Edita `.env` y pon el valor, por ejemplo `PUBLIC_HOST=192.168.1.50`. Debe ser **solo el host**, sin `http://` ni puerto.
+
+### 4. Generar `WSO2_ENCRYPTION_KEY`
+
+```bash
 sed -i "s/^WSO2_ENCRYPTION_KEY=.*/WSO2_ENCRYPTION_KEY=$(openssl rand -hex 32)/" .env
+grep WSO2_ENCRYPTION_KEY .env    # debe mostrar 64 caracteres hexadecimales
+```
+
+Si queda vacía, `docker compose` se detiene con `Defina WSO2_ENCRYPTION_KEY en .env`.
+
+### 5. (Opcional) Secretos de los canales
+
+Por defecto los clientes de los canales usan `banca-persona-secret`, `banca-empresa-secret` y `banca-mujer-secret`. Para cambiarlos, agrega a `.env`:
+
+```bash
+BANCA_PERSONA_CLIENT_SECRET=$(openssl rand -hex 16)
+BANCA_EMPRESA_CLIENT_SECRET=...
+BANCA_MUJER_CLIENT_SECRET=...
+```
+
+El mismo valor lo usan el job `setup` (lo asigna al cliente en Keycloak) y la aplicación Next.js (lo presenta al pedir el token), así que no hay que copiarlo a mano en ningún otro lugar.
+
+### 6. Levantar
+
+```bash
 docker compose up -d --build
 ```
+
+Orden de arranque (lo controlan los `depends_on` y `healthcheck` de `docker-compose.yml`):
+
+1. `clientes-api`, `cuentas-api`, `movimiento-api` y `keycloak`.
+2. `wso2am-volumes` ajusta los permisos del volumen de Solr y termina; después arranca `wso2am` (**2-4 minutos** hasta quedar *healthy*).
+3. Con todo *healthy*, se ejecuta una vez el job **`setup`**, que configura Keycloak y WSO2 (ver [Arranque](#arranque)).
+4. Si `setup` termina bien, arrancan `banca-persona`, `banca-empresa` y `banca-mujer`.
+
+### 7. Verificar
+
+```bash
+docker compose ps                        # todo "healthy"; setup y wso2am-volumes en "Exited (0)"
+docker compose logs setup | tail -30     # debe terminar sin errores
+```
+
+Luego abre `http://localhost:3101` (banca-persona) y las consolas de la tabla de [Acceso desde otras máquinas](#acceso-desde-otras-máquinas-public_host). Si `setup` falló, los canales no arrancan: revisa `docker compose logs setup`, corrige y vuelve a ejecutarlo con `docker compose run --rm setup` (es idempotente) y luego `docker compose up -d`.
+
+### Variables de entorno
+
+**Definidas por ti en `.env`** (las únicas que tienes que tocar):
+
+| Variable | Obligatoria | De dónde sale | Para qué sirve | Quién la usa |
+|---|:-:|---|---|---|
+| `PUBLIC_HOST` | no (por defecto `localhost`) | La eliges tú: `localhost` o la IP/DNS del servidor | Host público de WSO2 y Keycloak: login de las consolas de WSO2, URLs del gateway, issuer (`iss`) de los tokens de Keycloak | `wso2am` (`deployment.toml`), `keycloak` (`KC_HOSTNAME`), `setup` (`KEYCLOAK_PUBLIC_URL`, `GATEWAY_VHOST`), pruebas `setup/test-*.mjs` |
+| `WSO2_ENCRYPTION_KEY` | **sí** | `openssl rand -hex 32` | Clave AES con la que WSO2 cifra los secretos en su base de datos (sección `[encryption]` de `wso2/deployment.toml`). **No la cambies sin borrar el volumen `wso2am-db`**: WSO2 no podría descifrar lo ya guardado | `wso2am` |
+| `BANCA_PERSONA_CLIENT_SECRET` | no (`banca-persona-secret`) | La eliges tú | Secreto del cliente `banca-persona` en `reino-banca-persona` | `setup`, `banca-persona` |
+| `BANCA_EMPRESA_CLIENT_SECRET` | no (`banca-empresa-secret`) | La eliges tú | Secreto del cliente `banca-empresa` en `reino-banca-empresa` | `setup`, `banca-empresa` |
+| `BANCA_MUJER_CLIENT_SECRET` | no (`banca-mujer-secret`) | La eliges tú | Secreto del cliente `banca-mujer` en `reino-banca-persona` | `setup`, `banca-mujer` |
+
+**Fijadas en `docker-compose.yml`** (valores de desarrollo; normalmente no se cambian):
+
+| Servicio | Variable | Valor | Para qué sirve |
+|---|---|---|---|
+| APIs | `PORT` | `3001` / `3002` / `3003` | Puerto de escucha del servicio |
+| APIs | `LOG_FORMAT` | `combined` | Formato de log HTTP (morgan) |
+| `keycloak` | `KC_BOOTSTRAP_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Usuario administrador inicial de Keycloak (solo se crea en el primer arranque) |
+| `keycloak` | `KC_HOSTNAME` | `http://${PUBLIC_HOST}:8180` | Issuer fijo de los tokens y URL del login/consola |
+| `keycloak` | `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` | `true` | Los endpoints de backchannel (token, JWKS, DCR) responden con el host de la petición, así WSO2 y los canales usan `keycloak:8080` por la red interna |
+| `keycloak` | `KC_HEALTH_ENABLED` | `true` | Habilita `/health/ready` (puerto 9000) para el healthcheck |
+| `wso2am` | `PUBLIC_HOST`, `WSO2_ENCRYPTION_KEY` | de `.env` | Se leen en `deployment.toml` con `$env{...}` |
+| `setup` | `KEYCLOAK_URL` | `http://keycloak:8080` | API de administración de Keycloak por la red interna |
+| `setup` | `KEYCLOAK_PUBLIC_URL` | `http://${PUBLIC_HOST}:8180` | Issuer público que se registra en los Key Managers de WSO2 y en los Identity Providers de los reinos |
+| `setup` | `KEYCLOAK_ADMIN_USER` / `_PASSWORD` | `admin` / `admin` | Credenciales para configurar Keycloak |
+| `setup` | `KEYCLOAK_WSO2_CLIENT_SECRET` | `wso2-km-secret` | Secreto del cliente `wso2-km` con el que WSO2 registra aplicaciones en cada reino (DCR) |
+| `setup` | `WSO2_URL` / `GATEWAY_URL` | `https://wso2am:9443` / `https://wso2am:8243` | APIs de administración de WSO2 y gateway por la red interna |
+| `setup` | `GATEWAY_VHOST` | `${PUBLIC_HOST}` | Vhost en que se despliegan las APIs y productos (debe coincidir con el host de `http_endpoint` en `deployment.toml`) |
+| `setup` | `WSO2_ADMIN_USER` / `_PASSWORD` | `admin` / `admin` | Credenciales para configurar WSO2 |
+| `setup` | `NODE_TLS_REJECT_UNAUTHORIZED` | `0` | Acepta el certificado autofirmado de WSO2 |
+| canales | `PORT` | `3101` / `3102` / `3103` | Puerto de la aplicación Next.js |
+| canales | `KEYCLOAK_URL` | `http://keycloak:8080` | Keycloak por la red interna (endpoint de token) |
+| canales | `GATEWAY_URL` | `http://wso2am:8280` | Gateway de WSO2 por la red interna |
+| canales | `CHANNEL_REALM` / `CHANNEL_CLIENT_ID` | p. ej. `reino-banca-persona` / `banca-persona` | Reino y cliente del canal en Keycloak |
+| canales | `CHANNEL_CLIENT_SECRET` | de `.env` (`BANCA_*_CLIENT_SECRET`) | Secreto del cliente del canal |
+
+Los servicios hablan entre sí por los nombres de la red `banca` (`keycloak:8080`, `wso2am:9443`), no por `PUBLIC_HOST`. `PUBLIC_HOST` solo importa para lo que ve el navegador y para el `iss` de los tokens.
 
 ## Endpoints
 
@@ -82,7 +195,7 @@ WSO2 redirige el login de sus consolas a su `hostname`, y Keycloak usa `KC_HOSTN
 - `wso2/deployment.toml` (montado en el contenedor) usa `hostname = "$env{PUBLIC_HOST}"` y el mismo host en las URLs del gateway. La clave `[encryption]` con la que WSO2 cifra los secretos de su base de datos sale de **`WSO2_ENCRYPTION_KEY` en `.env`** (genérala con `openssl rand -hex 32`): no la cambies sin borrar el volumen `wso2am-db`.
 - Keycloak: `KC_HOSTNAME=http://${PUBLIC_HOST}:8180`, y el issuer queda como `http://<PUBLIC_HOST>:8180/realms/<reino>`.
 
-Para usar otra IP o un nombre DNS (por ejemplo la de la red local), cambia `PUBLIC_HOST` y ejecuta `docker compose up -d`. El job `setup` actualiza el issuer de los Key Managers y el vhost de los despliegues. Los tokens emitidos antes del cambio dejan de ser válidos.
+Para usar otra IP o un nombre DNS, sigue [Cambiar de host](#cambiar-de-host-ip--localhost-y-callback-de-las-consolas-de-wso2).
 
 | Consola | URL | Usuario |
 |---|---|---|
@@ -97,6 +210,69 @@ Para usar otra IP o un nombre DNS (por ejemplo la de la red local), cambia `PUBL
 > Keycloak se publica en el puerto **8180** del host (el 8080 lo usa otro servicio). WSO2 usa un certificado autofirmado emitido para `localhost`: el navegador mostrará una advertencia que hay que aceptar.
 
 Los datos persisten en los volúmenes `wso2am-db`, `wso2am-solr` (índice de búsqueda de WSO2) y `keycloak-data`. `docker compose down -v` los borra y el siguiente `up` recrea todo.
+
+### Cambiar de host (IP ↔ localhost) y callback de las consolas de WSO2
+
+Aplica al pasar de `localhost` a una IP, de una IP a `localhost` o de una IP a otra.
+
+**1. Cambia `PUBLIC_HOST` en `.env` y recrea los contenedores**
+
+```bash
+sed -i "s/^PUBLIC_HOST=.*/PUBLIC_HOST=192.168.1.50/" .env    # o PUBLIC_HOST=localhost
+docker compose up -d
+```
+
+`docker compose up -d` recrea `wso2am`, `keycloak` y `setup` porque cambió su configuración, y el job `setup` corrige lo que depende del host:
+- el **issuer** de los Key Managers de WSO2 (`http://<PUBLIC_HOST>:8180/realms/<reino>`);
+- el **issuer** de los Identity Providers `reino-banca-*` en `reino-cliente` y `reino-cuenta`;
+- el **vhost** de las APIs y productos desplegados en el gateway.
+
+Los tokens emitidos antes del cambio llevan el `iss` anterior y dejan de ser válidos (duran 5 min). Los canales (`banca-*`) no necesitan cambios: usan la red interna.
+
+**2. Actualiza el callback de las consolas de WSO2**
+
+El Publisher, el Developer Portal y la consola Admin inician sesión con OAuth contra el propio WSO2. Cada consola es una aplicación OAuth interna (`apim_publisher`, `apim_devportal`, `apim_admin_portal`) con una **callback URL registrada**, que WSO2 genera con el `hostname` del **primer** arranque y guarda en la base de datos (volumen `wso2am-db`). `deployment.toml` no la actualiza después, y el job `setup` tampoco.
+
+Si el host cambió y la callback no lo incluye, el login de la consola falla con un error como *"Registered callback does not match with the provided url"* o *"callback URL mismatch"*.
+
+Para corregirla, en la consola de administración de Carbon (no usa esa callback, así que entra aunque el Publisher falle):
+
+1. Abre `https://<PUBLIC_HOST>:9443/carbon` (o `https://localhost:9443/carbon` desde el servidor) e inicia sesión con `admin` / `admin`.
+2. Ve a **Main → Identity → Service Providers → List**.
+3. En `apim_publisher`, pulsa **Edit → Inbound Authentication Configuration → OAuth/OpenID Connect Configuration → Edit**.
+4. Reemplaza **Callback Url** por una expresión regular que acepte todos los hosts que vas a usar (así no tendrás que volver a editarla al cambiar entre ellos):
+   ```
+   regexp=(https://(localhost|127\.0\.0\.1|192\.168\.1\.50|100\.64\.0\.10):9443/publisher/services/auth/callback/(login|logout))
+   ```
+   Sustituye las IPs por las tuyas, con los puntos escapados (`\.`). Si agregas un nombre DNS, escápalo igual (`banca\.midominio\.com`).
+5. Pulsa **Update** y luego **Update** en la página del Service Provider.
+6. Repite los pasos 3-5 con `apim_devportal` y `apim_admin_portal`, cambiando `/publisher/` por `/devportal/` y `/admin/`:
+   ```
+   regexp=(https://(localhost|127\.0\.0\.1|192\.168\.1\.50|100\.64\.0\.10):9443/devportal/services/auth/callback/(login|logout))
+   regexp=(https://(localhost|127\.0\.0\.1|192\.168\.1\.50|100\.64\.0\.10):9443/admin/services/auth/callback/(login|logout))
+   ```
+7. Cierra la pestaña de la consola (o borra las cookies de `<PUBLIC_HOST>:9443`) y vuelve a entrar a `https://<PUBLIC_HOST>:9443/publisher`.
+
+Para ver la callback registrada sin entrar a la consola:
+
+```bash
+for app in apim_publisher apim_devportal apim_admin_portal; do
+  curl -sk -u admin:admin -H 'Content-Type: text/xml' -H 'SOAPAction: urn:getOAuthApplicationDataByAppName' \
+    -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:x=\"http://org.apache.axis2/xsd\"><s:Body><x:getOAuthApplicationDataByAppName><x:appName>$app</x:appName></x:getOAuthApplicationDataByAppName></s:Body></s:Envelope>" \
+    https://localhost:9443/services/OAuthAdminService | grep -o 'callbackUrl>[^<]\+'
+done
+```
+
+> Las aplicaciones OAuth de las consolas solo existen después del primer inicio de sesión en cada una. Con un volumen `wso2am-db` nuevo, entra primero a las consolas con el `PUBLIC_HOST` definitivo; si luego cambias de host, edita la callback como se indica arriba.
+>
+> Alternativa sin editar nada: `docker compose down -v && docker compose up -d` borra todos los datos (incluidas las aplicaciones y claves creadas en el Developer Portal) y WSO2 vuelve a generar las callbacks con el host nuevo.
+
+**3. Verifica**
+
+```bash
+curl -s http://<PUBLIC_HOST>:8180/realms/reino-cuenta/.well-known/openid-configuration | grep -o '"issuer":"[^"]*"'
+NODE_TLS_REJECT_UNAUTHORIZED=0 node setup/test-canales.mjs    # lee PUBLIC_HOST de .env
+```
 
 ### Flujo M2M para un consumidor
 
