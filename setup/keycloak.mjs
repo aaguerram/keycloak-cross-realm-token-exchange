@@ -181,17 +181,11 @@ async function ensureRealmRole(realm, name, description) {
 // Reino del canal: cliente confidencial con Client Credentials y, por cada reino de API, un client
 // scope opcional "aud-<reino>" que agrega esa audiencia. El canal pide scope=aud-<reino> y recibe un
 // token cuya única audiencia es el reino destino: es el que presenta como client assertion en ese
-// reino. No se usa Token Exchange.
+// reino.
 async function setupChannelRealm(channel) {
   await ensureRealm(channel);
   const audienceScopes = [];
   for (const { realm } of REALMS) {
-    // Versiones anteriores creaban un cliente por reino destino como audiencia del Token Exchange
-    const legacy = await findClient(channel.realm, realm);
-    if (legacy) {
-      await kc('DELETE', `/${channel.realm}/clients/${legacy.id}`);
-      console.log(`- Cliente ${realm} eliminado de ${channel.realm} (ya no se usa Token Exchange)`);
-    }
     audienceScopes.push(await ensureAudienceScope(channel.realm, realm, { realmDefault: false }));
   }
 
@@ -209,7 +203,6 @@ async function setupChannelRealm(channel) {
     // Sin roles en el token: con los roles por defecto del reino Keycloak agregaría aud=account y la
     // assertion tendría varias audiencias
     fullScopeAllowed: false,
-    attributes: { 'standard.token.exchange.enabled': 'false' },
   });
   // Opcionales: el token lleva solo la audiencia del reino que se pide en scope (una por assertion)
   for (const id of audienceScopes) {

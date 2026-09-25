@@ -5,9 +5,8 @@
 //      anterior como client assertion (RFC 7523, federated client authentication)
 //   3. Llama a todas las operaciones de los productos pro-cliente y pro-cuenta y verifica que solo
 //      respondan 200 las permitidas al canal (el resto, 403 por scope)
-// Además verifica los casos que deben fallar: Token Exchange directo entre reinos, reutilización de
-// la assertion, token del canal con varias audiencias y token del canal directo en el gateway.
-// No se usa Token Exchange en la cadena.
+// Además verifica los casos que deben fallar: reutilización de la assertion, token del canal con
+// varias audiencias y token del canal directo en el gateway.
 // Uso: NODE_TLS_REJECT_UNAUTHORIZED=0 node setup/test-canales.mjs  (usa PUBLIC_HOST de .env)
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
@@ -17,8 +16,6 @@ const { VERSION, REALMS, SCOPES, CHANNELS, realmOfApi } = await import('./config
 const HOST = process.env.PUBLIC_HOST ?? 'localhost';
 const GATEWAY = process.env.GATEWAY_URL ?? `https://${HOST}:8243`;
 const KEYCLOAK = process.env.KEYCLOAK_PUBLIC_URL ?? `http://${HOST}:8180`;
-const TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange';
-const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
 const JWT_BEARER = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 
 const claims = (jwt) => JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
@@ -87,16 +84,6 @@ for (const channel of CHANNELS) {
   const both = await homeToken(channel, ...REALMS.map((r) => r.realm));
   const multiAudience = await federatedToken(REALMS[0].realm, both.access_token);
   check(multiAudience.status >= 400, `Token del canal con varias audiencias como assertion → ${multiAudience.status} (${multiAudience.error_description})`);
-
-  const freshAssertion = (await homeToken(channel, REALMS[1].realm)).access_token;
-  const crossExchange = await token(REALMS[1].realm, {
-    grant_type: TOKEN_EXCHANGE,
-    client_assertion_type: JWT_BEARER,
-    client_assertion: freshAssertion,
-    subject_token: home.access_token,
-    subject_token_type: ACCESS_TOKEN_TYPE,
-  });
-  check(crossExchange.status >= 400, `Token Exchange directo en ${REALMS[1].realm} con subject_token de ${channel.realm} → ${crossExchange.status} (${crossExchange.error_description})`);
 
   // WSO2 responde 500 (900900 "Unclassified Authentication Failure") a un JWT cuyo emisor no es un
   // Key Manager registrado: el reino del canal no lo es, así que su token nunca llega al backend

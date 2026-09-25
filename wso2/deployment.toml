@@ -271,11 +271,6 @@ username = "${admin.username}"
 password = "${admin.password}"
 'header.X-WSO2-KEY-MANAGER' = "default"
 
-[oauth.grant_type.token_exchange]
-enable = true
-allow_refresh_tokens = true
-iat_validity_period = "1h"
-
 #[apim.transaction_counter]
 #enable = true
 #server_id = "Gateway1"

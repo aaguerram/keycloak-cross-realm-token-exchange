@@ -309,14 +309,9 @@ Cada aplicación **solo tiene credenciales en el reino de su canal** y usa OAuth
 
 Un reino de canal puede tener varias aplicaciones: `banca-mujer` está registrada en `reino-banca-persona`, junto a `banca-persona`. Ambas comparten el Identity Provider `reino-banca-persona` en los reinos de API, pero cada una tiene su propio cliente, su rol (`perfil-banca-persona` o `perfil-banca-mujer`) y sus permisos. Los reinos de API distinguen a las dos aplicaciones por el `sub` de la assertion (el service account de cada cliente).
 
-### ¿Sirve Token Exchange entre reinos?
+### Cómo obtiene los tokens
 
-No directamente. En Keycloak 26.7:
-- **Token Exchange estándar (RFC 8693, v2, soportado)** solo intercambia tokens **dentro del mismo reino**. Un `subject_token` de otro reino se rechaza (lo verifica `setup/test-canales.mjs`).
-- **Token Exchange legacy (v1)** sí acepta tokens externos a través de un Identity Provider, pero exige habilitar la feature `token-exchange` (preview) y `admin-fine-grained-authz:v1` (**deprecada**). No se usa.
-- La opción soportada es **Federated client authentication (RFC 7523)**, *supported* desde 26.6: el reino destino registra al reino del canal como Identity Provider y acepta sus tokens como `client_assertion`.
-
-Por eso la solución **no usa Token Exchange**: solo Client Credentials y client assertions federadas.
+Se usa **Federated client authentication (RFC 7523)**, *supported* en Keycloak desde 26.6: el reino destino registra al reino del canal como Identity Provider y acepta sus tokens como `client_assertion`. Todo es Client Credentials con client assertions federadas.
 
 ```
 banca-persona ──(1) client_credentials + secret  scope=aud-reino-cuenta ──▶ reino-banca-persona
@@ -333,7 +328,7 @@ La client assertion debe tener **una sola audiencia**, que es el reino destino. 
 ### Qué configura el setup
 
 En `reino-banca-persona` y `reino-banca-empresa`:
-- El cliente confidencial del canal, con service account, Token Exchange deshabilitado y `fullScopeAllowed=false` (sin roles en el token; con los roles por defecto del reino Keycloak agregaría `aud=account` y la assertion tendría varias audiencias).
+- El cliente confidencial del canal, con service account y `fullScopeAllowed=false` (sin roles en el token; con los roles por defecto del reino Keycloak agregaría `aud=account` y la assertion tendría varias audiencias).
 - Un client scope `aud-<reino>` por cada reino de API (`reino-cliente`, `reino-cuenta`), asignado al canal como **opcional**.
 
 En `reino-cliente` y `reino-cuenta`:
